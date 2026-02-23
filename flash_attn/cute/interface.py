@@ -745,7 +745,10 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    # SM100+ backward kernel rounds tile_hdim to 16; match that here so the
+    # dQ accumulator layout is consistent between the kernel and postprocess.
+    hdim_round = 16 if arch // 10 >= 10 else 32
+    head_dim_rounded = (head_dim + hdim_round - 1) // hdim_round * hdim_round
 
     if cu_seqlens_q is None:
         dq_accum = torch.empty(

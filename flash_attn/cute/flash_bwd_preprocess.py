@@ -47,8 +47,8 @@ class FlashAttentionBackwardPreprocess:
         self.dtype = dtype
         self.m_block_size = m_block_size
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
+        # padding head_dim: SM100+ rounds to 16, matching the main backward kernel
+        hdim_multiple_of = 16 if arch // 10 >= 10 else 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.num_threads = num_threads

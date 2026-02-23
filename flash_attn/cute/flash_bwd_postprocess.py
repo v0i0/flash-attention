@@ -55,8 +55,8 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x) are supported"
         )
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
+        # padding head_dim: SM100+ rounds to 16, matching the main backward kernel
+        hdim_multiple_of = 16 if arch // 10 >= 10 else 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
@@ -176,8 +176,12 @@ class FlashAttentionBackwardPostprocess:
 
         num_copy_elems = 128 // self.dtype.width
         threads_per_row = self.tile_hdim // num_copy_elems
+        # For non-power-of-2 hdims (e.g. 96), threads_per_row may not divide
+        # num_threads evenly. Use the largest compatible thread count; extra
+        # threads will skip the gmem store in the kernel.
+        self.num_threads_copy_dQ = (self.num_threads // threads_per_row) * threads_per_row
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
-            self.dtype, threads_per_row, self.num_threads, num_copy_elems
+            self.dtype, threads_per_row, self.num_threads_copy_dQ, num_copy_elems
         )
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQ
@@ -186,6 +190,8 @@ class FlashAttentionBackwardPostprocess:
         # then setting kBlockKSmem to 32 will cause "Static shape_div failure".
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
         mma_shape_n = self.tiled_mma.get_tile_size(1)
+        # SM100+ always uses a ComposedLayout for sdQ.
+        self._sdQ_composed = self.arch // 10 >= 10
         if const_expr(self.arch == 80):
             sdQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, mma_shape_n)
             self.sdQ_layout = cute.tile_to_shape(
@@ -195,10 +201,22 @@ class FlashAttentionBackwardPostprocess:
             self.sdQ_layout = sm90_utils.make_smem_layout(
                 self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim)
             )
-        else:
-            # TODO: this is hard-coded for hdim 128
+        elif const_expr(self._sdQ_composed):
             self.sdQ_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), 1
+            )
+        else:
+            # Non-power-of-2 hdim (e.g. 96): the auto-selected swizzle may
+            # pick SW128 (64-element segments) which doesn't divide 96.
+            # Force SW32 (16-element segments) which divides any multiple
+            # of 16 and still reduces bank conflicts.
+            from cutlass.utils.blackwell_helpers import (
+                SmemLayoutAtomKind,
+                make_smem_layout_atom,
+            )
+            c_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_SW32, self.dtype)
+            self.sdQ_layout = cute.tile_to_shape(
+                c_atom, (self.tile_m, self.tile_hdim, 1), order=(1, 0, 2)
             )
 
     @cute.jit
@@ -303,14 +321,14 @@ class FlashAttentionBackwardPostprocess:
         smem = cutlass.utils.SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
-        if const_expr(self.arch in [80, 90]):
-            sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
-        else:
-            # extra stage dimension
+        if const_expr(self._sdQ_composed):
+            # ComposedLayout from make_smem_layout_epi: extra stage dimension
             sdQ = cute.make_tensor(
                 cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
                 sdQ_layout.outer,
             )[None, None, 0]
+        else:
+            sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
         sdQt = layout_utils.transpose_view(sdQ)
 
         # Thread index, block index
@@ -561,7 +579,11 @@ class FlashAttentionBackwardPostprocess:
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
             cute.arch.barrier()  # make sure all smem stores are done
-            gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
+            # For non-power-of-2 hdims (e.g. 96), the gmem tiled copy may use
+            # fewer threads than the block. Wrap the index so get_slice always
+            # receives a valid value; extra threads skip the gmem store below.
+            tidx_gmem = tidx % self.num_threads_copy_dQ
+            gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx_gmem)
             tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
             tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
             tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
@@ -571,11 +593,16 @@ class FlashAttentionBackwardPostprocess:
             # Step 5: Copy dQ from register to gmem
             tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
             tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
-            for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
-                if tdQcdQ[0, rest_m, 0][0] < seqlen_q - m_block * self.tile_m:
-                    cute.copy(
-                        gmem_tiled_copy_dQ,
-                        tdQrdQ[None, rest_m, None],
-                        tdQgdQ[None, rest_m, None],
-                        pred=tdQpdQ[None, rest_m, None],
-                    )
+            # Cap at tile_m to prevent writes beyond the tile when the tiled
+            # copy has fewer row groups than tile_m (e.g. 10 groups for 128
+            # rows with d=96 overshoots to row 129).
+            seqlen_q_local = cutlass.min(self.tile_m, seqlen_q - m_block * self.tile_m)
+            if tidx < self.num_threads_copy_dQ:
+                for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
+                    if tdQcdQ[0, rest_m, 0][0] < seqlen_q_local:
+                        cute.copy(
+                            gmem_tiled_copy_dQ,
+                            tdQrdQ[None, rest_m, None],
+                            tdQgdQ[None, rest_m, None],
+                            pred=tdQpdQ[None, rest_m, None],
+                        )

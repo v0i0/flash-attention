@@ -2934,43 +2934,55 @@ class FlashAttentionBackwardSm100:
                     if not process_tile:
                         should_zero_dKV = True
 
-                if should_zero_dKV:
-                    # like other epis, currently assumes hdim == hdimv
-                    # For 2-CTA: use cluster-wide tile size (cta_group_size * tile_n)
-                    cluster_tile_n = self.tile_n * self.cta_group_size
-                    n_block_for_tile = n_block // self.cta_group_size
-                    gmem_tiled_copy_zero_dKV = copy_utils.tiled_copy_2d(
-                        self.dk_dtype,
-                        self.tile_hdim,
-                        128,  # num_threads
-                    )
-                    gmem_thr_copy_zero_dKV = gmem_tiled_copy_zero_dKV.get_slice(dp_idx)
-                    mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
-                    mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
-                    gdK = cute.local_tile(
-                        mdK_cur, (cluster_tile_n, self.tile_hdim), (n_block_for_tile, 0)
-                    )
-                    gdV = cute.local_tile(
-                        mdV_cur, (cluster_tile_n, self.tile_hdimv), (n_block_for_tile, 0)
-                    )
-                    tdKgdK = gmem_thr_copy_zero_dKV.partition_D(gdK)
-                    tdVgdV = gmem_thr_copy_zero_dKV.partition_D(gdV)
-                    assert tdKgdK.shape[2] == 1
-                    assert tdVgdV.shape[2] == 1
-                    cdKV = cute.make_identity_tensor((cluster_tile_n, self.tile_hdim))
-                    tdKVcdKV = gmem_thr_copy_zero_dKV.partition_D(cdKV)
-                    zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
-                    zero.fill(0.0)
-                    if tidx < 128:
-                        for i in cutlass.range_constexpr(tdKgdK.shape[1]):
-                            row_idx = tdKVcdKV[0, i, 0][0]
-                            if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
-                                cute.copy(gmem_tiled_copy_zero_dKV, zero, tdKgdK[None, i, 0])
-                    else:
-                        for i in cutlass.range_constexpr(tdVgdV.shape[1]):
-                            row_idx = tdKVcdKV[0, i, 0][0]
-                            if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
-                                cute.copy(gmem_tiled_copy_zero_dKV, zero, tdVgdV[None, i, 0])
+                if const_expr(self.is_local or self.is_varlen_q or self.use_block_sparsity):
+                    if should_zero_dKV:
+                        # like other epis, currently assumes hdim == hdimv
+                        # For 2-CTA: use cluster-wide tile size (cta_group_size * tile_n)
+                        cluster_tile_n = self.tile_n * self.cta_group_size
+                        n_block_for_tile = n_block // self.cta_group_size
+                        # Compute num_threads compatible with tile_hdim for tiled_copy_2d.
+                        # For non-power-of-2 hdims (e.g. 96), 128 threads may not evenly
+                        # divide the row, so we round down to the largest compatible count.
+                        _max_copy_elems = 128 // self.dk_dtype.width
+                        _copy_vec_elems = math.gcd(self.tile_hdim, _max_copy_elems)
+                        _threads_per_row = self.tile_hdim // _copy_vec_elems
+                        _num_threads_zero = (128 // _threads_per_row) * _threads_per_row
+                        gmem_tiled_copy_zero_dKV = copy_utils.tiled_copy_2d(
+                            self.dk_dtype,
+                            self.tile_hdim,
+                            _num_threads_zero,
+                        )
+                        # Clamp dp_idx for threads beyond _num_threads_zero so get_slice
+                        # receives a valid index; those threads will skip the copy below.
+                        _dp_idx_zero = dp_idx % _num_threads_zero
+                        gmem_thr_copy_zero_dKV = gmem_tiled_copy_zero_dKV.get_slice(_dp_idx_zero)
+                        mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
+                        mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
+                        gdK = cute.local_tile(
+                            mdK_cur, (cluster_tile_n, self.tile_hdim), (n_block_for_tile, 0)
+                        )
+                        gdV = cute.local_tile(
+                            mdV_cur, (cluster_tile_n, self.tile_hdimv), (n_block_for_tile, 0)
+                        )
+                        tdKgdK = gmem_thr_copy_zero_dKV.partition_D(gdK)
+                        tdVgdV = gmem_thr_copy_zero_dKV.partition_D(gdV)
+                        assert tdKgdK.shape[2] == 1
+                        assert tdVgdV.shape[2] == 1
+                        cdKV = cute.make_identity_tensor((cluster_tile_n, self.tile_hdim))
+                        tdKVcdKV = gmem_thr_copy_zero_dKV.partition_D(cdKV)
+                        zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
+                        zero.fill(0.0)
+                        if dp_idx < _num_threads_zero:
+                            if tidx < 128:
+                                for i in cutlass.range_constexpr(tdKgdK.shape[1]):
+                                    row_idx = tdKVcdKV[0, i, 0][0]
+                                    if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
+                                        cute.copy(gmem_tiled_copy_zero_dKV, zero, tdKgdK[None, i, 0])
+                            else:
+                                for i in cutlass.range_constexpr(tdVgdV.shape[1]):
+                                    row_idx = tdKVcdKV[0, i, 0][0]
+                                    if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
+                                        cute.copy(gmem_tiled_copy_zero_dKV, zero, tdVgdV[None, i, 0])
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
