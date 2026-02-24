@@ -222,7 +222,8 @@ class FlashAttentionBackwardSm100:
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue
-        self.dK_reduce_ncol = 32
+        # Must divide tile_hdim // 2 (columns per WG) evenly.
+        self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -377,15 +378,34 @@ class FlashAttentionBackwardSm100:
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
         # headdim_64 gets 1 stage
         self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
+        # dKV_postprocess (GQA) path uses dK_reduce_ncol-wide smem, not sdKV_epi_tile
+        self.num_epi_stages_postprocess = max(1, (self.tile_hdim // 2) // self.dK_reduce_ncol)
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
+        self.sdKV_flat_epi_tile_postprocess = (
+            self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages_postprocess
+        )
         # TODO: dK and dV could have different shapes
         if const_expr(not self.dKV_postprocess):
-            self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
-                self.dk_dtype,
-                LayoutEnum.ROW_MAJOR,
-                self.sdKV_epi_tile,
-                2,  # num compute wgs
-            )
+            epi_cols = self.sdKV_epi_tile[1]
+            if epi_cols & (epi_cols - 1) == 0:
+                # Power-of-2 epi tile width: use auto-selected swizzle
+                self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
+                    self.dk_dtype,
+                    LayoutEnum.ROW_MAJOR,
+                    self.sdKV_epi_tile,
+                    2,  # num compute wgs
+                )
+            else:
+                # Non-power-of-2 (e.g. 48 for hdim 96): force SW32 whose
+                # 16-element segments divide any multiple of 16.
+                from cutlass.utils.blackwell_helpers import (
+                    SmemLayoutAtomKind,
+                    make_smem_layout_atom,
+                )
+                c_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_SW32, self.dk_dtype)
+                self.sdKV_layout = cute.tile_to_shape(
+                    c_atom, (*self.sdKV_epi_tile, 2), order=(1, 0, 2)
+                )
         else:
             self.sdKV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
 
@@ -3406,7 +3426,7 @@ class FlashAttentionBackwardSm100:
                 ((None, wg_idx),)
             ]  # (cta_group_tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(
-                gdKV, (self.sdKV_flat_epi_tile,)
+                gdKV, (self.sdKV_flat_epi_tile_postprocess,)
             )  # (cta_group_tile_n * hdim / 2 / epi_stage, epi_stage)
 
         deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
@@ -3426,10 +3446,13 @@ class FlashAttentionBackwardSm100:
             num_epi_stages = cute.size(tdKVgdKV.shape[1])
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
-            num_epi_stages = self.num_epi_stages
+            num_epi_stages = self.num_epi_stages_postprocess
 
+        # Repetition must divide tile_hdim // 2 (columns per WG) evenly.
+        # For d=96: 48 / 16 = 3 ✓.  For d=128: 64 / 16 = 4 ✓.
+        _dKV_epi_rep = 16 if (self.tile_hdim // 2) % 32 != 0 else 32
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(_dKV_epi_rep)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)

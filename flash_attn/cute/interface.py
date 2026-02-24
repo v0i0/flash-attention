@@ -776,7 +776,7 @@ def _flash_attn_bwd(
 
     dKV_postprocess = qhead_per_kvhead > 1
     if dKV_postprocess:
-        head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        head_dim_v_rounded = (head_dim_v + hdim_round - 1) // hdim_round * hdim_round
         if cu_seqlens_k is None:
             num_n_blocks = seqlen_k_rounded // n_block_size
             if cluster_size == 2 and num_n_blocks % cluster_size != 0:
