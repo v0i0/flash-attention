@@ -58,7 +58,7 @@ VERBOSE = True
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 96, 128], ids=lambda d: f"d{d}")
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -387,7 +387,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 96, 128], ids=lambda d: f"d{d}")
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1372,7 +1372,7 @@ def test_flash_attn_kvcache(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 96, 128], ids=lambda d: f"d{d}")
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtype):
     if IS_SM90 and d == 64 and not causal:

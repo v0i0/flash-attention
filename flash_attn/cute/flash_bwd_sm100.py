@@ -221,8 +221,7 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
-        # number of tma reduce adds for dKacc and dVacc epilogue
-        # Must divide tile_hdim // 2 (columns per WG) evenly.
+        # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
         self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -377,18 +376,22 @@ class FlashAttentionBackwardSm100:
             min(128 // (self.dk_dtype.width // 8), self.tile_hdim // 2),  # 64 or 32
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
         # headdim_64 gets 1 stage
-        self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
-        # dKV_postprocess (GQA) path uses dK_reduce_ncol-wide smem, not sdKV_epi_tile
-        self.num_epi_stages_postprocess = max(1, (self.tile_hdim // 2) // self.dK_reduce_ncol)
-        self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
-        self.sdKV_flat_epi_tile_postprocess = (
-            self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages_postprocess
-        )
+        hdim_per_wg = self.tile_hdim // 2
+        self.num_epi_stages = max(1, hdim_per_wg // self.sdKV_epi_tile[1])
+        self.sdKV_flat_epi_tile = self.tile_n * hdim_per_wg // self.num_epi_stages
+        # GQA postprocess path uses dK_reduce_ncol-wide smem instead of sdKV_epi_tile
+        if hdim_per_wg % 32 != 0:
+            self.num_epi_stages_postprocess = max(1, hdim_per_wg // self.dK_reduce_ncol)
+            self.sdKV_flat_epi_tile_postprocess = (
+                self.tile_n * hdim_per_wg // self.num_epi_stages_postprocess
+            )
+        else:
+            self.num_epi_stages_postprocess = self.num_epi_stages
+            self.sdKV_flat_epi_tile_postprocess = self.sdKV_flat_epi_tile
         # TODO: dK and dV could have different shapes
         if const_expr(not self.dKV_postprocess):
             epi_cols = self.sdKV_epi_tile[1]
             if epi_cols & (epi_cols - 1) == 0:
-                # Power-of-2 epi tile width: use auto-selected swizzle
                 self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
                     self.dk_dtype,
                     LayoutEnum.ROW_MAJOR,
@@ -396,15 +399,11 @@ class FlashAttentionBackwardSm100:
                     2,  # num compute wgs
                 )
             else:
-                # Non-power-of-2 (e.g. 48 for hdim 96): force SW32 whose
-                # 16-element segments divide any multiple of 16.
-                from cutlass.utils.blackwell_helpers import (
-                    SmemLayoutAtomKind,
-                    make_smem_layout_atom,
-                )
-                c_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_SW32, self.dk_dtype)
+                # Non-power-of-2 epi tile: force SW32 to avoid incompatible swizzle
+                from cutlass.utils.blackwell_helpers import SmemLayoutAtomKind, make_smem_layout_atom
+                sw32_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_SW32, self.dk_dtype)
                 self.sdKV_layout = cute.tile_to_shape(
-                    c_atom, (*self.sdKV_epi_tile, 2), order=(1, 0, 2)
+                    sw32_atom, (*self.sdKV_epi_tile, 2), order=(1, 0, 2)
                 )
         else:
             self.sdKV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
@@ -2960,22 +2959,17 @@ class FlashAttentionBackwardSm100:
                         # For 2-CTA: use cluster-wide tile size (cta_group_size * tile_n)
                         cluster_tile_n = self.tile_n * self.cta_group_size
                         n_block_for_tile = n_block // self.cta_group_size
-                        # Compute num_threads compatible with tile_hdim for tiled_copy_2d.
-                        # For non-power-of-2 hdims (e.g. 96), 128 threads may not evenly
-                        # divide the row, so we round down to the largest compatible count.
-                        _max_copy_elems = 128 // self.dk_dtype.width
-                        _copy_vec_elems = math.gcd(self.tile_hdim, _max_copy_elems)
-                        _threads_per_row = self.tile_hdim // _copy_vec_elems
-                        _num_threads_zero = (128 // _threads_per_row) * _threads_per_row
+                        max_copy_elems = 128 // self.dk_dtype.width
+                        copy_vec_elems = math.gcd(self.tile_hdim, max_copy_elems)
+                        threads_per_row = self.tile_hdim // copy_vec_elems
+                        num_threads_zero = (128 // threads_per_row) * threads_per_row
                         gmem_tiled_copy_zero_dKV = copy_utils.tiled_copy_2d(
                             self.dk_dtype,
                             self.tile_hdim,
-                            _num_threads_zero,
+                            num_threads_zero,
                         )
-                        # Clamp dp_idx for threads beyond _num_threads_zero so get_slice
-                        # receives a valid index; those threads will skip the copy below.
-                        _dp_idx_zero = dp_idx % _num_threads_zero
-                        gmem_thr_copy_zero_dKV = gmem_tiled_copy_zero_dKV.get_slice(_dp_idx_zero)
+                        dp_idx_zero = dp_idx % num_threads_zero
+                        gmem_thr_copy_zero_dKV = gmem_tiled_copy_zero_dKV.get_slice(dp_idx_zero)
                         mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
                         mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
                         gdK = cute.local_tile(
@@ -2992,7 +2986,7 @@ class FlashAttentionBackwardSm100:
                         tdKVcdKV = gmem_thr_copy_zero_dKV.partition_D(cdKV)
                         zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
                         zero.fill(0.0)
-                        if dp_idx < _num_threads_zero:
+                        if dp_idx < num_threads_zero:
                             if tidx < 128:
                                 for i in cutlass.range_constexpr(tdKgdK.shape[1]):
                                     row_idx = tdKVcdKV[0, i, 0][0]
@@ -3448,11 +3442,9 @@ class FlashAttentionBackwardSm100:
         else:
             num_epi_stages = self.num_epi_stages_postprocess
 
-        # Repetition must divide tile_hdim // 2 (columns per WG) evenly.
-        # For d=96: 48 / 16 = 3 ✓.  For d=128: 64 / 16 = 4 ✓.
-        _dKV_epi_rep = 16 if (self.tile_hdim // 2) % 32 != 0 else 32
+        dKV_epi_rep = 16 if (self.tile_hdim // 2) % 32 != 0 else 32
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(_dKV_epi_rep)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(dKV_epi_rep)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)
