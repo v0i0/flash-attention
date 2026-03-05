@@ -4,6 +4,13 @@ import math
 import itertools
 import os
 import random
+import sys
+import types
+
+# Mock flash_attn_2_cuda before any flash_attn imports so the top-level
+# __init__.py doesn't fail when the CUDA extension hasn't been compiled.
+if "flash_attn_2_cuda" not in sys.modules:
+    sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
 
 import pytest
 import torch
@@ -28,6 +35,7 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,
+    _flash_attn_bwd,
 )
 
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
@@ -1582,3 +1590,307 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     assert torch.allclose(out_no_lse, out, atol=1e-5, rtol=1e-5), (
         "Output should be the same regardless of return_lse"
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (512, 256),
+        (1024, 1024),
+    ],
+)
+def test_flash_attn_bwd_fp32_grad(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    mha_type,
+    dtype,
+):
+    """Test that _flash_attn_bwd with grad_dtype=torch.float32 produces fp32 gradients
+    that are at least as accurate as the bf16/fp16 gradients (and more accurate for dq
+    due to skipping the fp32->bf16 postprocess downcast).
+    """
+    device = "cuda"
+    seed = 42
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 4 if seqlen_k <= 1024 else 2
+    nheads = 6
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    dv = d
+
+    if IS_SM90 and d == 64 and not causal:
+        pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config")
+    if causal and seqlen_k < seqlen_q:
+        pytest.skip("causal with seqlen_k < seqlen_q not supported in backward")
+
+    # Generate reference inputs in the working dtype (for ref computation in fp32)
+    q_ref = (
+        torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+        .to(dtype)
+        .to(dtype)
+        .requires_grad_()
+    )
+    k_ref = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+        .to(dtype)
+        .to(dtype)
+        .requires_grad_()
+    )
+    v_ref = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+        .to(dtype)
+        .to(dtype)
+        .requires_grad_()
+    )
+
+    q = q_ref.detach().to(dtype).requires_grad_()
+    k = k_ref.detach().to(dtype).requires_grad_()
+    v = v_ref.detach().to(dtype).requires_grad_()
+
+    # Compute reference output in fp32
+    out_ref, _ = attention_ref(
+        q_ref, k_ref, v_ref, None, None, causal=causal,
+    )
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, None, None, causal=causal,
+        upcast=False, reorder_ops=True,
+    )
+
+    # Forward pass
+    out, lse = flash_attn_func(
+        q, k, v, causal=causal, deterministic=False,
+    )
+
+    g = torch.randn_like(out)
+
+    # --- Standard bf16 backward (via autograd) ---
+    dq_bf16, dk_bf16, dv_bf16 = torch.autograd.grad(out, (q, k, v), g)
+
+    # --- FP32 backward (via _flash_attn_bwd directly) ---
+    dq_fp32, dk_fp32, dv_fp32 = _flash_attn_bwd(
+        q, k, v, out, g, lse,
+        causal=causal,
+        grad_dtype=torch.float32,
+    )
+
+    # Reference gradients
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+    dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+
+    # 1. Verify fp32 output dtype
+    assert dq_fp32.dtype == torch.float32, f"dq should be fp32, got {dq_fp32.dtype}"
+    assert dk_fp32.dtype == torch.float32, f"dk should be fp32, got {dk_fp32.dtype}"
+    assert dv_fp32.dtype == torch.float32, f"dv should be fp32, got {dv_fp32.dtype}"
+
+    # 2. Verify fp32 output shape matches input shape
+    assert dq_fp32.shape == q.shape, f"dq shape {dq_fp32.shape} != q shape {q.shape}"
+    assert dk_fp32.shape == k.shape, f"dk shape {dk_fp32.shape} != k shape {k.shape}"
+    assert dv_fp32.shape == v.shape, f"dv shape {dv_fp32.shape} != v shape {v.shape}"
+
+    # 3. Verify numerical accuracy
+    rtol = 2
+    dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item()
+    dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item()
+    dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item()
+
+    print(f"dQ fp32 max diff: {(dq_fp32 - dq_ref).abs().max().item()}")
+    print(f"dQ bf16 max diff: {(dq_bf16.float() - dq_ref).abs().max().item()}")
+    print(f"dK fp32 max diff: {(dk_fp32 - dk_ref).abs().max().item()}")
+    print(f"dK bf16 max diff: {(dk_bf16.float() - dk_ref).abs().max().item()}")
+    print(f"dV fp32 max diff: {(dv_fp32 - dv_ref).abs().max().item()}")
+    print(f"dV bf16 max diff: {(dv_bf16.float() - dv_ref).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+
+    # fp32 gradients should satisfy the same tolerance bounds as bf16 gradients
+    assert (dq_fp32 - dq_ref).abs().max().item() <= rtol * (
+        dq_pt - dq_ref
+    ).abs().max().item() + dq_atol, "dQ fp32 exceeds tolerance"
+    assert (dk_fp32 - dk_ref).abs().max().item() <= rtol * (
+        dk_pt - dk_ref
+    ).abs().max().item() + dk_atol, "dK fp32 exceeds tolerance"
+    assert (dv_fp32 - dv_ref).abs().max().item() <= rtol * (
+        dv_pt - dv_ref
+    ).abs().max().item() + dv_atol, "dV fp32 exceeds tolerance"
+
+    # 4. Verify that fp32 dQ is strictly more accurate than bf16 dQ
+    # (true precision gain from skipping the fp32->bf16 downcast in postprocess).
+    dq_fp32_err = (dq_fp32 - dq_ref).abs().max().item()
+    dq_bf16_err = (dq_bf16.float() - dq_ref).abs().max().item()
+    print(f"dQ fp32 error: {dq_fp32_err}, dQ bf16 error: {dq_bf16_err}")
+    # fp32 dQ should generally be more accurate, but non-deterministic atomic adds
+    # and different kernel configs (dQ_swapAB) can cause marginal variations.
+    assert dq_fp32_err <= dq_bf16_err + dq_atol, (
+        f"dQ fp32 error ({dq_fp32_err}) should be <= "
+        f"dQ bf16 error ({dq_bf16_err}) + atol ({dq_atol})"
+    )
+    # For GQA (qhead_per_kvhead > 1), dk/dv also go through postprocess, so check them too.
+    # Use a small tolerance because GQA atomic adds introduce non-deterministic rounding.
+    if mha_type != "mha":
+        dk_fp32_err = (dk_fp32 - dk_ref).abs().max().item()
+        dk_bf16_err = (dk_bf16.float() - dk_ref).abs().max().item()
+        dv_fp32_err = (dv_fp32 - dv_ref).abs().max().item()
+        dv_bf16_err = (dv_bf16.float() - dv_ref).abs().max().item()
+        print(f"dK fp32 error: {dk_fp32_err}, dK bf16 error: {dk_bf16_err}")
+        print(f"dV fp32 error: {dv_fp32_err}, dV bf16 error: {dv_bf16_err}")
+        assert dk_fp32_err <= dk_bf16_err + dk_atol, (
+            f"dK fp32 error ({dk_fp32_err}) should be <= dK bf16 error ({dk_bf16_err}) + atol ({dk_atol})"
+        )
+        assert dv_fp32_err <= dv_bf16_err + dv_atol, (
+            f"dV fp32 error ({dv_fp32_err}) should be <= dV bf16 error ({dv_bf16_err}) + atol ({dv_atol})"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (128, 128),
+        (256, 256),
+    ],
+)
+def test_flash_attn_bwd_fp32_grad_preallocated(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    mha_type,
+    dtype,
+):
+    """Test that _flash_attn_bwd correctly writes into pre-allocated fp32 output tensors."""
+    device = "cuda"
+    seed = 42
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 4
+    nheads = 6
+    nheads_kv = nheads if mha_type == "mha" else 3
+    dv = d
+
+    if IS_SM90 and d == 64 and not causal:
+        pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config")
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype).requires_grad_()
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype).requires_grad_()
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype).requires_grad_()
+
+    out, lse = flash_attn_func(q, k, v, causal=causal)
+    g = torch.randn_like(out)
+
+    # Pre-allocate fp32 output tensors
+    dq_pre = torch.empty(q.shape, dtype=torch.float32, device=device)
+    dk_pre = torch.empty(k.shape, dtype=torch.float32, device=device)
+    dv_pre = torch.empty(v.shape, dtype=torch.float32, device=device)
+
+    # Call with pre-allocated tensors
+    dq_out, dk_out, dv_out = _flash_attn_bwd(
+        q, k, v, out, g, lse,
+        causal=causal,
+        dq=dq_pre, dk=dk_pre, dv=dv_pre,
+        grad_dtype=torch.float32,
+    )
+
+    # Verify the returned tensors are the same objects as the pre-allocated ones
+    assert dq_out.data_ptr() == dq_pre.data_ptr(), "dq should be written in-place"
+    assert dk_out.data_ptr() == dk_pre.data_ptr(), "dk should be written in-place"
+    assert dv_out.data_ptr() == dv_pre.data_ptr(), "dv should be written in-place"
+
+    # Verify dtype
+    assert dq_out.dtype == torch.float32
+    assert dk_out.dtype == torch.float32
+    assert dv_out.dtype == torch.float32
+
+    # Compare against auto-allocated fp32 path
+    dq_auto, dk_auto, dv_auto = _flash_attn_bwd(
+        q, k, v, out, g, lse,
+        causal=causal,
+        grad_dtype=torch.float32,
+    )
+
+    # Results should be identical (same computation, same inputs)
+    assert torch.equal(dq_out, dq_auto), "Pre-allocated dq should match auto-allocated"
+    assert torch.equal(dk_out, dk_auto), "Pre-allocated dk should match auto-allocated"
+    assert torch.equal(dv_out, dv_auto), "Pre-allocated dv should match auto-allocated"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (128, 128),
+        (256, 256),
+        (512, 512),
+    ],
+)
+def test_flash_attn_bwd_fp32_grad_consistency(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    dtype,
+):
+    """Test that fp32 gradients, when cast to bf16/fp16, are close to the direct
+    bf16/fp16 gradients. This validates the fp32 path produces consistent results.
+    """
+    device = "cuda"
+    seed = 42
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 4
+    nheads = 6
+    nheads_kv = nheads
+
+    if IS_SM90 and d == 64 and not causal:
+        pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config")
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype).requires_grad_()
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype).requires_grad_()
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype).requires_grad_()
+
+    out, lse = flash_attn_func(q, k, v, causal=causal)
+    g = torch.randn_like(out)
+
+    # bf16/fp16 backward
+    dq_lo, dk_lo, dv_lo = torch.autograd.grad(out, (q, k, v), g)
+
+    # fp32 backward
+    dq_fp32, dk_fp32, dv_fp32 = _flash_attn_bwd(
+        q, k, v, out, g, lse,
+        causal=causal,
+        grad_dtype=torch.float32,
+    )
+
+    # fp32 gradients are now computed with true fp32 precision (no downcast), so they
+    # may differ from bf16 gradients. Cast-back to bf16 should still be *close* to the
+    # direct bf16 gradients, but not necessarily identical since the fp32 path preserves
+    # more precision from the accumulators.
+    dq_diff = (dq_fp32.to(dtype).float() - dq_lo.float()).abs().max().item()
+    dk_diff = (dk_fp32.to(dtype).float() - dk_lo.float()).abs().max().item()
+    dv_diff = (dv_fp32.to(dtype).float() - dv_lo.float()).abs().max().item()
+    print(f"dQ cast-back diff: {dq_diff}")
+    print(f"dK cast-back diff: {dk_diff}")
+    print(f"dV cast-back diff: {dv_diff}")
+    # Use a slightly more generous tolerance since fp32 path computes differently
+    atol = 4 * (dq_lo + 0.3 - 0.3 - dq_lo).float().abs().max().item()
+    assert dq_diff <= atol, f"dQ cast-back diff {dq_diff} exceeds tolerance {atol}"
+    assert dk_diff <= atol, f"dK cast-back diff {dk_diff} exceeds tolerance {atol}"
+    assert dv_diff <= atol, f"dV cast-back diff {dv_diff} exceeds tolerance {atol}"

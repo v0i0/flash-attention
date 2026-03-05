@@ -43,6 +43,7 @@ class FlashAttentionBackwardPostprocess:
         dQ_swapAB: bool = False,
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
+        output_dtype: Type[cutlass.Numeric] = None,
     ):
         """
         :param head_dim: head dimension
@@ -51,6 +52,7 @@ class FlashAttentionBackwardPostprocess:
         :type tile_m: int
         """
         self.dtype = dtype
+        self.output_dtype = output_dtype or dtype
         self.tile_m = tile_m
         assert arch // 10 in [8, 9, 10, 11], (
             "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x) are supported"
@@ -176,10 +178,10 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // dQaccum_reduce_stage, dQaccum_reduce_stage)
             )
 
-        num_copy_elems = 128 // self.dtype.width
+        num_copy_elems = 128 // self.output_dtype.width
         threads_per_row = math.gcd(128, self.tile_hdim) // num_copy_elems
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
-            self.dtype, threads_per_row, self.num_threads, num_copy_elems
+            self.output_dtype, threads_per_row, self.num_threads, num_copy_elems
         )
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQ
@@ -189,19 +191,55 @@ class FlashAttentionBackwardPostprocess:
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
         mma_shape_n = self.tiled_mma.get_tile_size(1)
         if const_expr(self.arch == 80):
-            sdQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, mma_shape_n)
+            sdQ_layout_atom = sm80_utils.get_smem_layout_atom(self.output_dtype, mma_shape_n)
             self.sdQ_layout = cute.tile_to_shape(
                 sdQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1)
             )
+            self.sdQ_gmem_layout = self.sdQ_layout
         elif const_expr(self.arch == 90):
-            self.sdQ_layout = sm90_utils.make_smem_layout(
-                self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim)
-            )
+            if const_expr(self.output_dtype.width == 16):
+                self.sdQ_layout = sm90_utils.make_smem_layout(
+                    self.output_dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim)
+                )
+                # sdQ_gmem_layout matches sdQ_layout (no transpose needed)
+                self.sdQ_gmem_layout = self.sdQ_layout
+            elif const_expr(self.dQ_swapAB):
+                # For fp32 + swapAB: create sdQ in the MMA's native (hdim, tile_m)
+                # shape so make_tiled_copy_C can partition_D(sdQ) directly (no
+                # transpose view needed). A separate row-major (tile_m, hdim) view
+                # of the same memory is used for the coalesced gmem write.
+                sw = cute.make_swizzle(1, 4, 3)
+                self.sdQ_layout = cute.make_composed_layout(
+                    sw, 0,
+                    cute.make_layout(
+                        (self.tile_hdim, self.tile_m),
+                        stride=(1, self.tile_hdim),
+                    ),
+                )
+                self.sdQ_gmem_layout = cute.make_composed_layout(
+                    sw, 0,
+                    cute.make_layout(
+                        (self.tile_m, self.tile_hdim),
+                        stride=(self.tile_hdim, 1),
+                    ),
+                )
+            else:
+                # For fp32 without swapAB: simple row-major with swizzle.
+                sw = cute.make_swizzle(1, 4, 3)
+                self.sdQ_layout = cute.make_composed_layout(
+                    sw, 0,
+                    cute.make_layout(
+                        (self.tile_m, self.tile_hdim),
+                        stride=(self.tile_hdim, 1),
+                    ),
+                )
+                self.sdQ_gmem_layout = self.sdQ_layout
         else:
             # TODO: this is hard-coded for hdim 128
             self.sdQ_layout = sm100_utils_basic.make_smem_layout_epi(
-                self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), 1
+                self.output_dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), 1
             )
+            self.sdQ_gmem_layout = self.sdQ_layout
 
     @cute.jit
     def __call__(
@@ -213,9 +251,8 @@ class FlashAttentionBackwardPostprocess:
         mSeqUsedQ: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
-        # Get the data type and check if it is fp16 or bf16
-        if const_expr(mdQ.element_type not in [cutlass.Float16, cutlass.BFloat16]):
-            raise TypeError("Only Float16 or BFloat16 is supported")
+        if const_expr(mdQ.element_type not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]):
+            raise TypeError("Only Float16, BFloat16, or Float32 is supported for output")
         if const_expr(mdQaccum is not None):
             if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
@@ -227,7 +264,7 @@ class FlashAttentionBackwardPostprocess:
 
         smem_size = max(
             cute.size_in_bytes(cutlass.Float32, self.sdQaccum_layout),
-            cute.size_in_bytes(self.dtype, self.sdQ_layout),
+            cute.size_in_bytes(self.output_dtype, self.sdQ_layout),
         )
 
         if const_expr(mCuSeqlensQ is not None):
@@ -269,6 +306,7 @@ class FlashAttentionBackwardPostprocess:
             self.dQ_swapAB,
             self.sdQaccum_layout,
             self.sdQ_layout,
+            self.sdQ_gmem_layout,
             self.g2s_tiled_copy_dQaccum,
             self.s2r_tiled_copy_dQaccum,
             self.gmem_tiled_copy_dQ,
@@ -293,6 +331,7 @@ class FlashAttentionBackwardPostprocess:
         dQ_swapAB: cutlass.Constexpr,
         sdQaccum_layout: cute.Layout,
         sdQ_layout: cute.ComposedLayout,
+        sdQ_gmem_layout: cute.ComposedLayout,
         g2s_tiled_copy_dQaccum: cute.TiledCopy,
         s2r_tiled_copy_dQaccum: cute.TiledCopy,
         gmem_tiled_copy_dQ: cute.TiledCopy,
@@ -303,16 +342,26 @@ class FlashAttentionBackwardPostprocess:
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
         smem = cutlass.utils.SmemAllocator()
-        sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
-        sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
-        if const_expr(self.arch in [80, 90]):
-            sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
+        # sdQaccum and sdQ share smem (used sequentially). Allocate for the larger.
+        sdQaccum_bytes = cute.size_in_bytes(cutlass.Float32, sdQaccum_layout)
+        sdQ_bytes = cute.size_in_bytes(self.output_dtype, sdQ_layout)
+        if const_expr(sdQ_bytes > sdQaccum_bytes and self.arch in [80, 90]):
+            # Allocate for the larger sdQ first, then overlay sdQaccum
+            sdQ = smem.allocate_tensor(self.output_dtype, sdQ_layout, byte_alignment=1024)
+            sdQaccum = cute.make_tensor(
+                cute.recast_ptr(sdQ.iterator, dtype=cutlass.Float32),
+                sdQaccum_layout,
+            )
         else:
-            # extra stage dimension
-            sdQ = cute.make_tensor(
-                cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
-                sdQ_layout.outer,
-            )[None, None, 0]
+            sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
+            if const_expr(self.arch in [80, 90]):
+                sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.output_dtype), sdQ_layout)
+            else:
+                sdQ = cute.make_tensor(
+                    cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.output_dtype),
+                    sdQ_layout.outer,
+                )[None, None, 0]
+        sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
         sdQt = layout_utils.transpose_view(sdQ)
 
         # Thread index, block index
@@ -525,27 +574,32 @@ class FlashAttentionBackwardPostprocess:
                     acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
                 tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
                 cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
-                # Convert tdQrdQaccum from fp32 to fp16/bf16
-                rdQ = cute.make_fragment_like(acc, self.dtype)
-                rdQ.store((acc.load() * scale).to(self.dtype))
+                # Scale and convert to output_dtype
+                rdQ = cute.make_fragment_like(acc, self.output_dtype)
+                rdQ.store((acc.load() * scale).to(self.output_dtype))
 
                 # Step 3: Copy dQ from register to smem
                 cute.arch.barrier()  # make sure all threads have finished loading dQaccum
                 if const_expr(self.arch in [80, 90]):
-                    copy_atom_r2s_dQ = utils.get_smem_store_atom(
-                        self.arch, self.dtype, transpose=self.dQ_swapAB
-                    )
+                    if const_expr(self.output_dtype.width == 16):
+                        copy_atom_r2s_dQ = utils.get_smem_store_atom(
+                            self.arch, self.output_dtype, transpose=self.dQ_swapAB
+                        )
+                    else:
+                        # For fp32: use single-element CopyUniversalOp to avoid
+                        # vectorization issues with swizzled composed layouts.
+                        copy_atom_r2s_dQ = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            self.output_dtype,
+                            num_bits_per_copy=self.output_dtype.width,
+                        )
                     tiled_copy_r2s_dQ = cute.make_tiled_copy_C(copy_atom_r2s_dQ, tiled_mma)
                 else:
-                    # copy_atom_r2s_dQ = sm100_utils_basic.get_smem_store_op(
-                    #     LayoutEnum.ROW_MAJOR, self.dtype, Float32, tiled_copy_t2r,
-                    # )
-                    # tiled_copy_r2s_dQ = cute.make_tiled_copy_D(copy_atom_r2s_dQ, tiled_copy_t2r)
                     thr_layout_r2s_dQ = cute.make_layout((self.num_threads, 1))  # 128 threads
-                    val_layout_r2s_dQ = cute.make_layout((1, 128 // self.dtype.width))
+                    val_layout_r2s_dQ = cute.make_layout((1, 128 // self.output_dtype.width))
                     copy_atom_r2s_dQ = cute.make_copy_atom(
                         cute.nvgpu.CopyUniversalOp(),
-                        self.dtype,
+                        self.output_dtype,
                         num_bits_per_copy=128,
                     )
                     tiled_copy_r2s_dQ = cute.make_tiled_copy_tv(
@@ -555,20 +609,30 @@ class FlashAttentionBackwardPostprocess:
                 cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
                 if const_expr(self.arch in [80, 90]):
                     taccdQrdQ = thr_copy_r2s_dQ.retile(rdQ)
+                    # For bf16 swapAB: write to sdQt (StMatrix handles transpose)
+                    # For fp32 swapAB: write to sdQ directly (sdQ is already in
+                    # MMA's native (hdim, tile_m) shape, no transpose needed)
+                    if const_expr(self.dQ_swapAB and self.output_dtype.width == 16):
+                        taccdQsdQ = thr_copy_r2s_dQ.partition_D(sdQt)
+                    else:
+                        taccdQsdQ = thr_copy_r2s_dQ.partition_D(sdQ)
                 else:
                     taccdQcdQ_shape = thr_copy_r2s_dQ.partition_S(cdQ).shape
                     taccdQrdQ = cute.make_tensor(rdQ.iterator, taccdQcdQ_shape)
-                taccdQsdQ = thr_copy_r2s_dQ.partition_D(
-                    sdQ if const_expr(not self.dQ_swapAB) else sdQt
-                )
+                    taccdQsdQ = thr_copy_r2s_dQ.partition_D(sdQ)
+
                 cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
             cute.arch.barrier()  # make sure all smem stores are done
             gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
             tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
-            tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
-            tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
+            # Use sdQ_gmem_layout for the gmem read view — for fp32 swapAB this
+            # provides a (tile_m, hdim) row-major view of the (hdim, tile_m) smem.
+            sdQ_for_gmem = cute.make_tensor(sdQ.iterator, sdQ_gmem_layout)
+            tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ_for_gmem)
+            tdQrdQ = cute.make_fragment_like(tdQsdQ, self.output_dtype)
+
             # TODO: check OOB when reading from smem if kBlockM isn't evenly tiled
             cute.autovec_copy(tdQsdQ, tdQrdQ)
 

@@ -609,6 +609,7 @@ def _flash_attn_bwd(
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
+    grad_dtype: Optional[torch.dtype] = None,
     score_mod: Optional[Callable] = None,
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
@@ -633,6 +634,8 @@ def _flash_attn_bwd(
         else:
             causal, local = False, True
 
+    grad_output_fp32 = grad_dtype == torch.float32
+
     if arch // 10 == 9:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
@@ -641,7 +644,7 @@ def _flash_attn_bwd(
         num_stages_PdS = 2
         SdP_swapAB = True
         dKV_swapAB = False
-        dQ_swapAB = not causal
+        dQ_swapAB = not causal  # fp32 transpose handled via dual smem layout in postprocess
         AtomLayoutMSdP = 1
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
@@ -771,21 +774,28 @@ def _flash_attn_bwd(
 
     device = q.device
     out_torch_dtype = q.dtype
+    if grad_output_fp32:
+        assert arch // 10 == 9, (
+            "fp32 gradient output is only supported on SM90 (Hopper)"
+        )
+        assert cu_seqlens_q is None and cu_seqlens_k is None, (
+            "fp32 gradient output is not supported with varlen (cu_seqlens) yet"
+        )
 
     if dq is None:
-        dq = torch.empty_like(q)
+        dq = torch.empty(q.shape, dtype=grad_dtype or q.dtype, device=device)
     else:
-        _validate_tensor(dq, "dq", q.shape, out_torch_dtype, device)
+        _validate_tensor(dq, "dq", q.shape, grad_dtype or out_torch_dtype, device)
 
     if dk is None:
-        dk = torch.empty_like(k)
+        dk = torch.empty(k.shape, dtype=grad_dtype or k.dtype, device=device)
     else:
-        _validate_tensor(dk, "dk", k.shape, out_torch_dtype, device)
+        _validate_tensor(dk, "dk", k.shape, grad_dtype or out_torch_dtype, device)
 
     if dv is None:
-        dv = torch.empty_like(v)
+        dv = torch.empty(v.shape, dtype=grad_dtype or v.dtype, device=device)
     else:
-        _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
+        _validate_tensor(dv, "dv", v.shape, grad_dtype or out_torch_dtype, device)
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 
@@ -813,6 +823,8 @@ def _flash_attn_bwd(
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
+    # GQA needs accum + postprocess (multiple Q heads reduce into one KV head).
+    # MHA fp32 writes fp32 directly via TMA S2G with fp32 smem layout in the kernel epilogue.
     dKV_postprocess = qhead_per_kvhead > 1
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
@@ -989,6 +1001,7 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            grad_output_fp32,
         )
     else:
         compile_key = (
@@ -1088,6 +1101,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                dKV_fp32=grad_output_fp32 and qhead_per_kvhead == 1,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -1169,7 +1183,8 @@ def _flash_attn_bwd(
         )
 
     num_threads = 256 if arch // 10 == 9 else 128
-    # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
+
+    # Postprocess kernel: convert dq_accum from float32 to dq
     compile_key_post = (
         arch,
         dtype,
@@ -1184,6 +1199,7 @@ def _flash_attn_bwd(
         1, # no cluster for tile_m
         get_broadcast_dims(dq_accum),
         get_broadcast_dims(dq),
+        grad_output_fp32,
     )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
@@ -1195,6 +1211,7 @@ def _flash_attn_bwd(
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs,
+            output_dtype=cutlass.Float32 if grad_output_fp32 else None,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1219,7 +1236,7 @@ def _flash_attn_bwd(
         )
 
     if dKV_postprocess:
-        # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
+        # Postprocess kernel: convert dk_accum & dv_accum from float32 to output
         compile_key_post = (
             arch,
             dtype,
@@ -1234,6 +1251,7 @@ def _flash_attn_bwd(
             cluster_size, # cluster is for tile_n
             get_broadcast_dims(dk_accum),
             get_broadcast_dims(dk),
+            grad_output_fp32,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
@@ -1245,6 +1263,7 @@ def _flash_attn_bwd(
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                output_dtype=cutlass.Float32 if grad_output_fp32 else None,
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1280,6 +1299,7 @@ def _flash_attn_bwd(
             cluster_size,
             get_broadcast_dims(dv_accum),
             get_broadcast_dims(dv),
+            grad_output_fp32,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dv_accum_tensor = to_cute_tensor(dv_accum)
@@ -1291,6 +1311,7 @@ def _flash_attn_bwd(
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                output_dtype=cutlass.Float32 if grad_output_fp32 else None,
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

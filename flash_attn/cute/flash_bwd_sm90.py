@@ -64,8 +64,10 @@ class FlashAttentionBackwardSm90:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        dKV_fp32: bool = False,
     ):
         self.dtype = dtype
+        self.dKV_fp32 = dKV_fp32
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -173,7 +175,7 @@ class FlashAttentionBackwardSm90:
             raise TypeError("dPsum tensor must be Float32")
         if const_expr(mdQaccum_type not in [Float32]):
             raise TypeError("dQaccum tensor must be Float32")
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(self.qhead_per_kvhead == 1 and not self.dKV_fp32):
             if const_expr(not (mdK_type == mdV_type == mQ_type)):
                 raise TypeError("mdK and mdV tensors must have the same data type as mQ")
         else:
@@ -204,6 +206,37 @@ class FlashAttentionBackwardSm90:
         )
         # dKVaccum for GQA epilogue - reuses sV+sK memory recast as f32
         # TODO: assert that sVaccum and sKaccum don't overflow smem
+        if const_expr(self.dKV_fp32):
+            # fp32 sub-tile smem layouts for epilogue TMA S2G.
+            # Each sub-tile covers one warp group's portion: (tile_n/num_wg, tile_hdim).
+            epi_sub_n = self.tile_n // self.num_mma_warp_groups
+            self.sdK_epi_sub_layout = sm90_utils.make_smem_layout(
+                Float32, LayoutEnum.ROW_MAJOR, (epi_sub_n, self.tile_hdim)
+            )
+            self.sdV_epi_sub_layout = sm90_utils.make_smem_layout(
+                Float32, LayoutEnum.ROW_MAJOR, (epi_sub_n, self.tile_hdimv)
+            )
+            # Per-warp-group MMA for the sub-tiled epilogue r2s copy.
+            sub_atom_layout_dKV = (1, 1)
+            sub_tiler_dK = (epi_sub_n, self.tile_hdim)
+            sub_tiler_dV = (epi_sub_n, self.tile_hdimv)
+            self.sub_tiled_mma_dK, self.sub_tiled_mma_dV = [
+                sm90_utils_basic.make_trivial_tiled_mma(
+                    self.dtype,
+                    self.dtype,
+                    warpgroup.OperandMajorMode.MN
+                    if not self.mma_dkv_is_rs
+                    else warpgroup.OperandMajorMode.K,
+                    warpgroup.OperandMajorMode.MN,
+                    Float32,
+                    atom_layout_mnk=sub_atom_layout_dKV + (1,),
+                    tiler_mn=sub_tiler,
+                    a_source=warpgroup.OperandSource.RMEM
+                    if self.mma_dkv_is_rs
+                    else warpgroup.OperandSource.SMEM,
+                )
+                for sub_tiler in (sub_tiler_dK, sub_tiler_dV)
+            ]
 
     def _get_tiled_mma(self):
         # S = Q @ K.T, dP = dO @ V.T
@@ -266,6 +299,8 @@ class FlashAttentionBackwardSm90:
                 (self.sdQaccum_layout, Float32),
             ]
         ]
+        # No struct enlargement needed: the fp32 epilogue writes sub-tiles
+        # (tile_n/num_wg × tile_hdim in fp32 = 32KB) that fit in the existing bf16 sK/sV.
 
         cosize_sdS = cute.cosize(self.sPdS_layout)
         cosize_sP = cute.cosize(self.sPdS_layout) if const_expr(not self.mma_dkv_is_rs) else 0
@@ -404,18 +439,34 @@ class FlashAttentionBackwardSm90:
             (self.tile_m, self.tile_hdimv),
         )
         if const_expr(self.qhead_per_kvhead == 1):
-            tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(),
-                mdK,
-                cute.select(self.sK_layout, mode=[0, 1]),
-                (self.tile_n, self.tile_hdim),
-            )
-            tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(),
-                mdV,
-                cute.select(self.sV_layout, mode=[0, 1]),
-                (self.tile_n, self.tile_hdimv),
-            )
+            if const_expr(self.dKV_fp32):
+                # fp32 sub-tiled epilogue: TMA atom covers one warp group's sub-tile
+                epi_sub_n = self.tile_n // self.num_mma_warp_groups
+                tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileS2GOp(),
+                    mdK,
+                    cute.select(self.sdK_epi_sub_layout, mode=[0, 1]),
+                    (epi_sub_n, self.tile_hdim),
+                )
+                tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileS2GOp(),
+                    mdV,
+                    cute.select(self.sdV_epi_sub_layout, mode=[0, 1]),
+                    (epi_sub_n, self.tile_hdimv),
+                )
+            else:
+                tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileS2GOp(),
+                    mdK,
+                    cute.select(self.sK_layout, mode=[0, 1]),
+                    (self.tile_n, self.tile_hdim),
+                )
+                tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileS2GOp(),
+                    mdV,
+                    cute.select(self.sV_layout, mode=[0, 1]),
+                    (self.tile_n, self.tile_hdimv),
+                )
         else:
             tma_atom_dK = tma_atom_dV = tma_tensor_dK = tma_tensor_dV = None
 
@@ -497,6 +548,8 @@ class FlashAttentionBackwardSm90:
             fastdiv_mods,
             blocksparse_tensors,
             qhead_per_kvhead_divmod,
+            self.sdK_epi_sub_layout if const_expr(self.dKV_fp32) else self.sK_layout,
+            self.sdV_epi_sub_layout if const_expr(self.dKV_fp32) else self.sV_layout,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -542,6 +595,8 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        sdK_epi_sub_layout: cute.ComposedLayout = None,
+        sdV_epi_sub_layout: cute.ComposedLayout = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -580,6 +635,17 @@ class FlashAttentionBackwardSm90:
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        # When dKV_fp32, create fp32 sub-tile smem for epilogue TMA S2G.
+        # Sub-tile = (tile_n/num_wg, tile_hdim) in fp32, fits in existing bf16 sK/sV space.
+        # The layouts are passed as kernel params to avoid MLIR region isolation issues.
+        sdK_epi_sub = storage.sK.get_tensor(
+            sdK_epi_sub_layout.outer, swizzle=sdK_epi_sub_layout.inner,
+            dtype=Float32 if const_expr(self.dKV_fp32) else self.dtype,
+        )
+        sdV_epi_sub = storage.sV.get_tensor(
+            sdV_epi_sub_layout.outer, swizzle=sdV_epi_sub_layout.inner,
+            dtype=Float32 if const_expr(self.dKV_fp32) else self.dtype,
+        )
         sP = None
         if const_expr(not self.mma_dkv_is_rs):
             sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
@@ -701,6 +767,8 @@ class FlashAttentionBackwardSm90:
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
+                sdK_epi_sub,
+                sdV_epi_sub,
             )
 
     @cute.jit
@@ -984,6 +1052,8 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        sdK_epi_sub: Optional[cute.Tensor] = None,
+        sdV_epi_sub: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1216,6 +1286,8 @@ class FlashAttentionBackwardSm90:
                     head_idx,
                     batch_idx,
                     qhead_per_kvhead_divmod,
+                    sdK_epi_sub,
+                    sdV_epi_sub,
                 )
             else:
                 # Block sparsity: KV tile with zero Q blocks produces no dK/dV; write zeros.
@@ -1239,6 +1311,8 @@ class FlashAttentionBackwardSm90:
                         head_idx,
                         batch_idx,
                         qhead_per_kvhead_divmod,
+                        sdK_epi_sub,
+                        sdV_epi_sub,
                     )
 
             tile_scheduler.advance_to_next_work()
@@ -1408,13 +1482,16 @@ class FlashAttentionBackwardSm90:
         head_idx: Int32,
         batch_idx: Int32,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        sdK_epi_sub: Optional[cute.Tensor] = None,
+        sdV_epi_sub: Optional[cute.Tensor] = None,
     ):
         epi_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.Epilogue), num_threads=self.num_mma_threads
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(self.qhead_per_kvhead == 1 and not self.dKV_fp32):
+            # bf16 MHA: full-tile TMA S2G
             mdV_cur = mdV[None, None, head_idx, batch_idx]
             mdK_cur = mdK[None, None, head_idx, batch_idx]
             gdK = cute.local_tile(mdK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
@@ -1449,6 +1526,61 @@ class FlashAttentionBackwardSm90:
             if warp_idx == 4:
                 store_dK()
                 cute.arch.cp_async_bulk_commit_group()
+        elif const_expr(self.dKV_fp32 and self.qhead_per_kvhead == 1):
+            # fp32 MHA: sub-tiled epilogue. Each sub-tile = one warp group's rows.
+            # Per-warp-group thread index for the sub-tile r2s copy.
+            epi_sub_n = self.tile_n // self.num_mma_warp_groups
+            wg_tidx = tidx % self.num_threads_per_warp_group
+            warp_group_idx = tidx // self.num_threads_per_warp_group
+
+            mdV_cur = mdV[None, None, head_idx, batch_idx]
+            mdK_cur = mdK[None, None, head_idx, batch_idx]
+
+            # Set up per-warp-group r2s copies (128 threads, sub-tile smem)
+            copy_dV_r2s_sub, _, _ = copy_utils.get_smem_store_C(
+                self.sub_tiled_mma_dV, sdV_epi_sub, wg_tidx, self.arch, transpose=False
+            )
+            copy_dK_r2s_sub, _, _ = copy_utils.get_smem_store_C(
+                self.sub_tiled_mma_dK, sdK_epi_sub, wg_tidx, self.arch, transpose=False
+            )
+
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+            # Write dV sub-tiles
+            for wg_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                gdV_sub = cute.local_tile(
+                    mdV_cur, (epi_sub_n, self.tile_hdimv), (n_block * self.num_mma_warp_groups + wg_idx, 0)
+                )
+                store_dV_sub, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_dV, 0, cute.make_layout(1), sdV_epi_sub, gdV_sub, single_stage=True
+                )
+                epi_barrier.arrive_and_wait()
+                if warp_group_idx == wg_idx:
+                    copy_dV_r2s_sub(acc_dV, dst_idx=None)
+                cute.arch.fence_view_async_shared()
+                epi_barrier.arrive_and_wait()
+                if warp_idx == 4:
+                    store_dV_sub()
+                    cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+            # Write dK sub-tiles
+            for wg_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                gdK_sub = cute.local_tile(
+                    mdK_cur, (epi_sub_n, self.tile_hdim), (n_block * self.num_mma_warp_groups + wg_idx, 0)
+                )
+                store_dK_sub, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_dK, 0, cute.make_layout(1), sdK_epi_sub, gdK_sub, single_stage=True
+                )
+                epi_barrier.arrive_and_wait()
+                if warp_group_idx == wg_idx:
+                    copy_dK_r2s_sub(acc_dK, dst_idx=None)
+                cute.arch.fence_view_async_shared()
+                epi_barrier.arrive_and_wait()
+                if warp_idx == 4:
+                    store_dK_sub()
+                    cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
         else:
             sdKaccum_shape0 = self.tile_n * self.tile_hdim // self.num_mma_warp_groups
             sdVaccum_shape0 = self.tile_n * self.tile_hdimv // self.num_mma_warp_groups
